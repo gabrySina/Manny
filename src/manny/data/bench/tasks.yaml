@@ -1,0 +1,41 @@
+# Benchmark tasks. `grade: pytest` runs the hidden tests of the task against the
+# workspace the agents produced; `grade: web` runs the static page check.
+tasks:
+  - name: bugfix
+    grade: pytest
+    prompt: >-
+      I test in test_stats.py falliscono. Correggi i bug in stats.py in modo che ogni
+      funzione faccia quello che dice la sua docstring. Non modificare test_stats.py.
+  - name: roman
+    grade: pytest
+    prompt: >-
+      Crea roman.py con due funzioni: to_roman(n: int) -> str e from_roman(s: str) -> int.
+      Sono validi i numeri da 1 a 3999. Solleva ValueError per i numeri fuori intervallo e
+      per le stringhe non valide: vuote, con caratteri sconosciuti, o in forma non canonica
+      come "IIII" o "VX". Scrivi anche i test pytest.
+  - name: userstore
+    grade: pytest
+    prompt: >-
+      Crea auth.py con la classe UserStore, usando solo la libreria standard.
+      register(username, password) registra un utente e solleva ValueError se lo username
+      esiste già, se è vuoto, o se la password ha meno di 8 caratteri.
+      login(username, password) restituisce True o False.
+      change_password(username, old_password, new_password) solleva ValueError se le
+      credenziali sono errate o se la nuova password ha meno di 8 caratteri.
+      Le password non devono mai essere conservate in chiaro: usa hashlib con un salt.
+      Scrivi anche i test pytest.
+  - name: wordfreq
+    grade: pytest
+    prompt: >-
+      Crea wordfreq.py con la funzione top_words(path, n=10), che restituisce una lista di
+      tuple (parola, conteggio). Legge un file di testo UTF-8 e conta le parole senza
+      distinguere maiuscole e minuscole, ignorando la punteggiatura. Ordina per conteggio
+      decrescente e, a parità, in ordine alfabetico; restituisce le prime n.
+      Solleva FileNotFoundError se il file non esiste e ValueError se n è minore di 1.
+      Aggiungi l'uso da riga di comando: "python wordfreq.py FILE [N]" stampa una riga
+      "parola: conteggio" per ogni risultato. Scrivi anche i test pytest.
+  - name: landing
+    grade: web
+    prompt: >-
+      Crea una landing page per il panificio artigianale "Forno Corsaro" di Catania:
+      presentazione, prodotti, orari e contatti.

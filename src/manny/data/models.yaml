@@ -1,0 +1,68 @@
+# Model catalog. Sizes are in MiB.
+#   size_mb         weights on disk (and in memory once loaded)
+#   mb_per_1k_ctx   memory growth per 1000 tokens of context
+#   max_ctx         largest context the model supports
+#   score           share of benchmark tests passed (`manny bench`), ranks the models that fit
+#   min_gpu_share   share that must sit on the GPU for a split to be usable (default 0.75)
+#   think           reasoning mode for models that have one
+# Memory figures follow Ollama's own accounting (`ollama ps`, version 0.40). Models marked
+# "measured" were loaded at 4096, 8192 and 16384 tokens; the others are scaled by architecture.
+models:
+  - name: qwen2.5-coder:1.5b
+    size_mb: 940
+    mb_per_1k_ctx: 27
+    max_ctx: 32768
+    score: 10
+  - name: qwen2.5-coder:3b
+    size_mb: 1840
+    mb_per_1k_ctx: 34
+    max_ctx: 32768
+    score: 25
+  # measured
+  - name: qwen2.5-coder:7b
+    size_mb: 4470
+    mb_per_1k_ctx: 53
+    max_ctx: 32768
+    score: 55
+  # Not benchmarked: scores are placed by size relative to the measured models.
+  - name: qwen2.5-coder:14b
+    size_mb: 8580
+    mb_per_1k_ctx: 183
+    max_ctx: 32768
+    score: 70
+  - name: qwen2.5-coder:32b
+    size_mb: 18900
+    mb_per_1k_ctx: 243
+    max_ctx: 32768
+    score: 80
+  # measured
+  - name: ornith:9b
+    size_mb: 5368
+    mb_per_1k_ctx: 34
+    max_ctx: 262144
+    # Full benchmark runs on a 6 GB card, one run each:
+    #   reasoning for fixers and stuck agents only (the default): 97 in 50 minutes
+    #   reasoning after every setback: 80 in 72 minutes
+    #   reasoning always: 100 in 60 minutes, then 0/8 on roman in a re-run
+    # `think` is the default for calls that do not choose (planning, review); agents
+    # follow agent.thinking.
+    score: 97
+    think: true
+  # measured at 8192 and 16384 tokens: sliding-window attention keeps context almost free.
+  # On a 6 GB card 60% of it sits in RAM, so it runs at about 4.5 tokens/s: 8/9 and 10/10
+  # on bugfix and userstore, where ornith:9b got 9/9 and 10/10 five to twenty-five times
+  # faster. Scored on those two tasks only; worth re-measuring on a card that holds it all.
+  - name: hf.co/unsloth/gemma-4-12b-it-GGUF:Q6_K
+    size_mb: 9499
+    mb_per_1k_ctx: 5
+    max_ctx: 262144
+    score: 80
+    min_gpu_share: 0.35
+  # measured: 8 tokens/s on a 6 GB card, 57% on the GPU. Not benchmarked for quality.
+  - name: gemma4:12b-it-qat
+    size_mb: 6870
+    mb_per_1k_ctx: 5
+    max_ctx: 262144
+    score: 75
+    min_gpu_share: 0.5
+    think: false
