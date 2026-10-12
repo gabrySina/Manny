@@ -34,7 +34,7 @@ def make(tmp_path, replies, verify=None, tier="gpu-6", rounds=0, verifiers=None,
     if verify is not None:
         verifiers = {"python": verify}
     orchestrator = Orchestrator(
-        manager, tools, AgentConfig(max_review_rounds=rounds, **agent_cfg), tier,
+        manager, tools, AgentConfig(**{"max_review_rounds": rounds, "audit_checklist": False, **agent_cfg}), tier,
         list_files=lambda: tools["list_files"].run(ListArgs()),
         verifiers=verifiers, snapshot=ws.snapshot, checkpoint=ws.checkpoint,
         fingerprint=ws.fingerprint, on_event=lambda *e: events.append(e),
@@ -369,7 +369,7 @@ def test_run_time_limit_stops_new_work_but_still_checks_the_result(tmp_path):
     tools = {t.name: t for t in fs_tools(ws)}
     checks = []
     orchestrator = Orchestrator(
-        manager, tools, AgentConfig(max_review_rounds=1, run_minutes=30), "gpu-6",
+        manager, tools, AgentConfig(max_review_rounds=1, run_minutes=30, audit_checklist=False), "gpu-6",
         list_files=lambda: "", verifiers={"python": lambda: checks.append(1) or (False, "1 failed")},
         snapshot=ws.snapshot, on_event=on_event, clock=lambda: now["t"],
     )
@@ -436,10 +436,54 @@ def test_fixers_think_while_ordinary_agents_do_not(tmp_path):
     ws = Workspace(tmp_path / "ws")
     tools = {t.name: t for t in fs_tools(ws)}
     orchestrator = Orchestrator(
-        manager, tools, AgentConfig(max_review_rounds=1), "gpu-6", list_files=lambda: "",
+        manager, tools, AgentConfig(max_review_rounds=1, audit_checklist=False), "gpu-6", list_files=lambda: "",
         verifiers={"python": lambda: (True, "ok")}, snapshot=ws.snapshot,
         checkpoint=ws.checkpoint, fingerprint=ws.fingerprint,
     )
     assert orchestrator.run("x").success
     # plan, coder, review, fixer write, fixer finish, confirmation
     assert [call["think"] for call in backend.calls] == [True, False, True, True, True, True]
+
+
+def audit(problem=None):
+    found = {"evidence": "traced register()", "violated": problem is not None,
+             "file": "server.py" if problem else "", "problem": problem or "", "fix": "handle it" if problem else ""}
+    return json.dumps(found)
+
+
+def test_checklist_audit_finds_what_the_open_review_approved(tmp_path):
+    replies = CODED + [
+        review(),                                             # the open review sees nothing wrong
+        audit("a duplicate username crashes with IntegrityError"), audit(), audit(),
+    ] + fixed(1) + [confirm(True)]
+    orchestrator, backend, _, events = make(
+        tmp_path, replies, verify=lambda: (True, "ok"), rounds=1, audit_checklist=True
+    )
+    result = orchestrator.run("login server")
+    assert result.success and result.issues == () and backend.replies == []
+    found = next(data for _, kind, data in events if kind == "review")
+    assert found == ["server.py: a duplicate username crashes with IntegrityError Fix: handle it"]
+    assert "Bad input is handled" in backend.calls[3]["messages"][1]["content"]
+
+
+def test_a_web_plan_over_python_code_is_checked_as_a_python_project(tmp_path):
+    used = []
+    verifiers = {"python": lambda: used.append("python") or (True, "ok"), "web": lambda: used.append("web") or (True, "ok")}
+    replies = [
+        kinded("web", [agent("frontend")], [task("t1", "frontend", tests=True)]),
+        action("finish", success=True, summary="page wired"),
+    ]
+    orchestrator, _, ws, _ = make(tmp_path, replies, verifiers=verifiers)
+    (ws.root / "server.py").write_text("app = Flask(__name__)")
+    (ws.root / "index.html").write_text("<html></html>")
+    result = orchestrator.run("fai funzionare la pagina con il server")
+    assert result.success and result.kind == "python" and set(used) == {"python"}
+
+
+def test_a_web_plan_without_python_code_stays_web(tmp_path):
+    used = []
+    verifiers = {"python": lambda: used.append("python") or (True, "ok"), "web": lambda: used.append("web") or (True, "ok")}
+    replies = [kinded("web", [agent("designer")], [task("t1", "designer", tests=True)]), action("finish", success=True, summary="x")]
+    orchestrator, _, ws, _ = make(tmp_path, replies, verifiers=verifiers)
+    (ws.root / "index.html").write_text("<html></html>")
+    assert orchestrator.run("landing page").kind == "web" and set(used) == {"web"}

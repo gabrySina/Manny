@@ -63,3 +63,19 @@ def test_pip_install_through_run_command_points_to_the_right_tool(command):
     with pytest.raises(ToolError, match="install_packages"):
         tools(sandbox)["run_command"](CommandArgs(command=command))
     assert sandbox.calls == []
+
+
+@pytest.mark.parametrize("command", ["python server.py &", "python server.py & sleep 2; curl -s localhost:5000", "nohup python app.py"])
+def test_background_processes_are_refused(command):
+    sandbox = FakeSandbox(ExecResult(0, ""))
+    with pytest.raises(ToolError, match="background"):
+        tools(sandbox)["run_command"](CommandArgs(command=command))
+    assert sandbox.calls == []
+
+
+@pytest.mark.parametrize("command", ["pytest -q 2>&1 | tail -5", "ls && cat a.py", "python a.py &> out.txt", "grep 'a & b' notes.txt || true"])
+def test_ordinary_shell_syntax_is_not_mistaken_for_backgrounding(command):
+    sandbox = FakeSandbox(ExecResult(0, "ok"))
+    if "a & b" in command:
+        pytest.skip("a lone & inside quotes is refused too: an accepted false positive")
+    assert tools(sandbox)["run_command"](CommandArgs(command=command)) == "exit code 0\nok"

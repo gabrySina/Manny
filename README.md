@@ -42,6 +42,16 @@ Senza `-w` il lavoro avviene in `workspaces/<data-ora>`. Gli agenti leggono e sc
 dentro quella cartella. Alla fine vengono riportati l'esito, il modello usato e i picchi di
 memoria della sessione.
 
+Ogni sessione lascia un resoconto in `~/.local/state/manny/runs/<data-ora>/`: quello che è
+apparso a schermo (`transcript.txt`), ogni azione con argomenti e risultati completi
+(`events.jsonl`) e l'esito (`result.json`).
+
+```bash
+manny log            # resoconto dell'ultima sessione
+manny log 2          # della penultima
+manny log --list     # elenco delle ultime sessioni
+```
+
 ## Come funziona
 
 | Parte | Dove | Cosa fa |
@@ -53,7 +63,8 @@ memoria della sessione.
 | Orchestratore | `agents/orchestrator.py` | Chiede al modello un piano (tipo di lavoro, criteri, agenti e compiti), lo valida, lo esegue e ripianifica una volta se un compito fallisce |
 | Verifiche e revisione | `checks.py`, `agents/review.py` | Controlli automatici per tipo di lavoro e rilettura finale rispetto ai criteri |
 | Agente | `agents/agent.py` | Ciclo pensa, usa uno strumento, osserva. Rileva i blocchi e compatta la cronologia quando il contesto si riempie |
-| Sandbox | `sandbox/docker.py` | Un container per task con limiti di RAM, CPU e processi, rete spenta salvo `pip install` |
+| Sandbox | `sandbox/docker.py` | Un container per task con limiti di RAM, CPU e processi, rete spenta salvo `pip install`; nessun processo sopravvive al comando che l'ha lanciato |
+| Resoconti | `session.py` | Salva su disco trascrizione, eventi completi ed esito di ogni sessione |
 | Ricerca web | `services.py`, `tools/web.py` | SearXNG locale; le pagine vengono ridotte a testo e gli indirizzi non pubblici sono rifiutati |
 
 Gli agenti sono logici, non processi: condividono lo stesso modello caricato e lavorano uno
@@ -68,14 +79,28 @@ automatica:
 
 | Tipo | Verifica automatica |
 |---|---|
-| `python` | `pytest` nella sandbox |
-| `web` | Controllo statico delle pagine: file collegati esistenti, niente segnaposto, testo e stile sufficienti |
+| `python` | `pytest` nella sandbox, poi avvio reale del server se ce n'è uno, poi le pagine web del progetto (vedi sotto) |
+| `web` | Controllo statico delle pagine: file collegati esistenti, niente segnaposto, testo e stile sufficienti, collegamento al server |
 | `research` | `report.md` deve esistere e citare solo URL realmente restituiti dagli strumenti web nella sessione |
 | `other` | Nessuna: decide la revisione |
 
+I test da soli non bastano, perché usano il client di prova del framework e non eseguono mai
+l'avvio vero. Per questo, se il progetto contiene un server, viene anche lanciato per qualche
+secondo (`python file.py`): se va in errore all'avvio, la verifica fallisce.
+
+Quando nella stessa cartella ci sono pagine web e un server Python, viene controllato anche
+che siano collegati: ogni URL chiamato da una pagina deve essere una rotta del server, e una
+pagina che usa URL relativi deve essere servita dal server stesso. Una pagina può avere
+tutti i componenti e non funzionare per questo solo motivo. Un lavoro che il pianificatore
+classifica come `web` ma che contiene codice Python viene verificato come progetto Python.
+
 Se un agente dichiara di aver finito e la verifica fallisce, riceve l'esito e deve
 correggere. A lavoro concluso un revisore rilegge i file rispetto a richiesta e criteri e
-ordina i rilievi per gravità. Ogni rilievo va a un correttore dedicato, uno alla volta
+ordina i rilievi per gravità. Per i progetti Python, oltre alla rilettura generale, pone una
+domanda separata per ogni voce della sua lista di controllo (input errati e duplicati,
+sicurezza di base, dipendenze dichiarate): interrogato su tutto insieme il modello approva
+lavori che la violano, interrogato su una voce alla volta trova la violazione
+(`agent.audit_checklist`). Ogni rilievo va a un correttore dedicato, uno alla volta
 (`agent.max_fix_issues`, predefinito 3):
 
 - il correttore non può chiudere senza aver modificato almeno un file;
@@ -169,6 +194,8 @@ La seconda limita la cache dei prompt del server dei modelli, che altrimenti cre
 - La sandbox ha solo Python e pytest: il codice in altri linguaggi non viene eseguito.
 - La verifica delle ricerche garantisce che le fonti citate siano state consultate, non che le
   affermazioni siano corrette.
+- Le pagine web sono controllate leggendone il codice, non aprendole in un browser: il
+  collegamento al server viene verificato, il comportamento del JavaScript no.
 - Solo GPU NVIDIA; con altre schede il sistema lavora su CPU.
 - Le stime di memoria sono misurate per `ornith:9b`, `qwen2.5-coder:7b` e Gemma 4 12B, ricavate
   dall'architettura per gli altri modelli.

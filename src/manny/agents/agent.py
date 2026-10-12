@@ -22,6 +22,8 @@ CHARS_PER_TOKEN = 3
 MAX_FAILED_REPEATS = 3
 # How much of the goal is repeated to an agent that keeps making the same call.
 GOAL_REMINDER_CHARS = 400
+# Tools that only look: calling one twice with nothing changed in between is a loop.
+READ_ONLY_TOOLS = frozenset({"list_files", "read_file", "run_tests", "web_search", "fetch_url"})
 # Sampling temperature added per consecutive repeated call, and its ceiling.
 REPEAT_TEMPERATURE_STEP = 0.4
 MAX_TEMPERATURE = 1.0
@@ -84,37 +86,48 @@ class Agent:
         dropped = 0
         failed_checks = 0
         previous, repeats = None, 0
+        # Read-only calls made since the last change to the workspace.
+        unchanged: set[tuple[str, str]] = set()
         failures: Counter[tuple[str, str]] = Counter()
         deadline = self._clock() + self._cfg.task_minutes * 60
         for step in range(1, self._cfg.max_steps + 1):
             if self._clock() > deadline:
                 return AgentResult(False, f"time limit ({self._cfg.task_minutes:g} minutes) reached", step - 1)
-            dropped = self._compact(messages, task, dropped)
+            compacted = self._compact(messages, task, dropped)
+            if compacted != dropped:
+                # Content dropped from the conversation may legitimately be read again.
+                unchanged.clear()
+            dropped = compacted
             # A model that repeats itself is in a rut: sample the next reply less greedily.
             temperature = min(MAX_TEMPERATURE, REPEAT_TEMPERATURE_STEP * repeats) if repeats else None
             try:
                 action = self._llm.structured(
-                    messages, Action, self._schema, temperature, self._think(stuck=repeats > 0)
+                    messages, Action, self._schema, temperature, self._think(stuck=repeats > 0),
+                    remaining=lambda: deadline - self._clock(),
                 )
             except LLMFormatError as exc:
                 return AgentResult(False, str(exc), step)
             self._on_event(self.spec.name, "action", action)
 
             signature = (action.tool, action.model_dump_json(include={"args"}))
-            repeated, previous = signature == previous, signature
+            # The same call again is a repetition also when other look-around calls came in
+            # between: nothing was changed, so it can only return what it returned before.
+            repeated = signature == previous or signature in unchanged
+            previous = signature
             repeats = repeats + 1 if repeated else 0
             if repeated and action.tool != FINISH and repeats > 1:
                 # Leave the repetition out of the history: seeing its own identical calls
                 # pile up is what keeps the model making them. The reminder is already there.
                 failures[signature] += 1
-                if failures[signature] >= MAX_FAILED_REPEATS:
+                # Stuck on one call, or going round in circles between several.
+                if failures[signature] >= MAX_FAILED_REPEATS or repeats >= MAX_FAILED_REPEATS:
                     return AgentResult(False, f"stuck repeating the same failing {action.tool} call", step)
                 continue
             messages.append({"role": "assistant", "content": action.model_dump_json()})
 
             if repeated and action.tool != FINISH:
                 observation = (
-                    f"ERROR: you just made this exact {action.tool} call and nothing has changed "
+                    f"ERROR: you already made this exact {action.tool} call and nothing has changed "
                     f"since, so the result is the same. Do not call {action.tool} again now. If "
                     "your goal is reached call finish, otherwise change a file first.\n"
                     f"Your goal: {goal[:GOAL_REMINDER_CHARS]}"
@@ -139,6 +152,10 @@ class Agent:
                     )
             else:
                 observation = self._call(action)
+            if action.tool in READ_ONLY_TOOLS:
+                unchanged.add(signature)
+            elif not observation.startswith("ERROR"):
+                unchanged.clear()
             if observation.startswith("ERROR"):
                 failures[signature] += 1
                 if failures[signature] >= MAX_FAILED_REPEATS:

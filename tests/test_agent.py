@@ -157,7 +157,8 @@ def test_agent_stops_at_the_task_time_limit(tmp_path):
     # Each look at the clock advances it by 100 seconds; the limit is 4 minutes.
     agent = Agent(SPEC, manager, tools, AgentConfig(task_minutes=4), clock=Clock(100))
     result = agent.run("goal")
-    assert not result.success and "time limit (4 minutes)" in result.summary and result.steps == 2
+    # Each step looks at the clock twice: once for the limit, once to size its reply.
+    assert not result.success and "time limit (4 minutes)" in result.summary and result.steps == 1
 
 
 def test_file_reads_reach_the_agent_whole_while_other_outputs_are_shortened(tmp_path):
@@ -241,3 +242,25 @@ def test_models_without_a_reasoning_mode_are_never_asked_to_think(tmp_path):
     agent, backend = thinking_agent(tmp_path, STEPS, think=None, deliberate=True)
     agent.run("goal")
     assert {call["think"] for call in backend.calls} == {None}
+
+
+def test_alternating_between_two_look_around_calls_is_a_loop(tmp_path):
+    look, read = action("list_files"), action("read_file", path="a.py")
+    replies = [action("write_file", path="a.py", content="x = 1"), look, read, look, read, look, read]
+    agent, backend, _, _ = make_agent(tmp_path, replies)
+    result = agent.run("goal")
+    # First look and read are fine; the second of each is refused, the third ends the task.
+    assert not result.success and "stuck repeating" in result.summary and result.steps == 6
+    assert "you already made this exact list_files call" in backend.calls[4]["messages"][-1]["content"]
+
+
+def test_reading_again_after_a_change_is_not_a_loop(tmp_path):
+    read, tests = action("read_file", path="a.py"), action("list_files")
+    replies = [
+        action("write_file", path="a.py", content="x = 1"), read, tests,
+        action("write_file", path="a.py", content="x = 2"), read, tests,
+        action("finish", success=True, summary="done"),
+    ]
+    agent, backend, _, _ = make_agent(tmp_path, replies)
+    assert agent.run("goal").success
+    assert not any("you already made" in m["content"] for m in backend.calls[-1]["messages"])

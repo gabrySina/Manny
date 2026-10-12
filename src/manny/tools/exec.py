@@ -20,6 +20,8 @@ TESTS_PASS_HINT = (
     "instead of making further changes."
 )
 PIP_INSTALL = re.compile(r"\bpip3?\s+install\b")
+# A lone & (not && and not part of a redirect such as 2>&1), or a detaching wrapper.
+BACKGROUND = re.compile(r"(?<![&>|])&(?![&>])|\bnohup\b|\bsetsid\b")
 # A requirement such as "requests" or "numpy>=1.26"; rejects options and shell syntax.
 REQUIREMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?([<>=!~]=?[A-Za-z0-9.*+!-]+)?")
 
@@ -58,6 +60,12 @@ def exec_tools(sandbox: Sandbox) -> list[Tool]:
     def run_command(args: CommandArgs) -> str:
         if PIP_INSTALL.search(args.command):
             raise ToolError("run_command has no network access: install packages with install_packages")
+        if BACKGROUND.search(args.command):
+            raise ToolError(
+                "run_command cannot start background processes or servers: nothing survives the "
+                "command. The final check starts your server itself; test a web application "
+                "through its framework's test client"
+            )
         return render(sandbox.exec(args.command))
 
     def run_tests(args: NoArgs) -> str:

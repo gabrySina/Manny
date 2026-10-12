@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -25,13 +26,34 @@ from manny.hardware.governor import MemoryGovernor, MemoryPressureError
 from manny.llm.base import LLMBackendError
 from manny.llm.catalog import ModelChoice, load_catalog, rank_choices
 from manny.llm.ollama import MIN_STRUCTURED_VERSION, OllamaClient
-from manny.runtime import SetupError, model_budget, run_task
+from manny.runtime import RunReport, SetupError, model_budget, run_task
 from manny.sandbox.docker import SandboxError
+from manny.session import RESULT, TRANSCRIPT, SessionLog, recent
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 services_app = typer.Typer(no_args_is_help=True, help="Servizi locali di supporto (SearXNG per la ricerca web).")
 app.add_typer(services_app, name="services")
 console = Console()
+
+
+class Output:
+    """Prints to the terminal and, during a run, to the session transcript as well."""
+
+    def __init__(self) -> None:
+        self.mirror: Console | None = None
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        console.print(*args, **kwargs)
+        if self.mirror is not None:
+            self.mirror.print(*args, **kwargs)
+
+    def rule(self, *args: Any, **kwargs: Any) -> None:
+        console.rule(*args, **kwargs)
+        if self.mirror is not None:
+            self.mirror.rule(*args, **kwargs)
+
+
+out = Output()
 
 # llama-server reads this to cap its in-RAM prompt cache, 8 GB by default.
 CACHE_RAM_VARIABLE = "LLAMA_ARG_CACHE_RAM"
@@ -163,15 +185,15 @@ def _short(value: Any, limit: int = 80) -> str:
 
 def _print_event(source: str, kind: str, data: Any) -> None:
     if kind == "plan" and isinstance(data, Plan):
-        console.print(f"Tipo di lavoro: [bold]{data.kind}[/bold]")
+        out.print(f"Tipo di lavoro: [bold]{data.kind}[/bold]")
         for criterion in data.criteria:
-            console.print(f"  criterio: {escape(criterion)}")
+            out.print(f"  criterio: {escape(criterion)}")
         team = Table(title="Squadra creata per questo task")
         for column in ("Agente", "Ruolo", "Strumenti"):
             team.add_column(column)
         for agent in data.agents:
             team.add_row(escape(agent.name), escape(agent.role), escape(", ".join(agent.tools)))
-        console.print(team)
+        out.print(team)
         work = Table(title="Piano di lavoro")
         for column in ("Id", "Agente", "Obiettivo", "Dipende da", "Test"):
             work.add_column(column)
@@ -180,28 +202,28 @@ def _print_event(source: str, kind: str, data: Any) -> None:
                 escape(node.id), escape(node.agent), escape(node.goal),
                 escape(", ".join(node.depends_on)), "sì" if node.gated else "",
             )
-        console.print(work)
+        out.print(work)
     elif kind == "task_start" and isinstance(data, TaskNode):
-        console.rule(escape(f"{data.id}: {data.agent}"))
+        out.rule(escape(f"{data.id}: {data.agent}"))
     elif kind == "action" and isinstance(data, Action):
         args = ", ".join(f"{key}={_short(value, 60)}" for key, value in data.args.items())
-        console.print(f"[cyan]{escape(source)}[/cyan] {escape(data.tool)}({escape(args)})")
+        out.print(f"[cyan]{escape(source)}[/cyan] {escape(data.tool)}({escape(args)})")
         if data.thought:
-            console.print(f"  [dim]{escape(_short(data.thought, 200))}[/dim]")
+            out.print(f"  [dim]{escape(_short(data.thought, 200))}[/dim]")
     elif kind == "observation":
-        console.print(f"  [dim]-> {escape(_short(data, 300))}[/dim]")
+        out.print(f"  [dim]-> {escape(_short(data, 300))}[/dim]")
     elif kind == "final_check":
         passed, output = data
         status = "[green]superata[/green]" if passed else "[red]non superata[/red]"
-        console.print(f"Verifica automatica: {status}")
-        console.print(f"  [dim]{escape(_short(output, 600))}[/dim]")
+        out.print(f"Verifica automatica: {status}")
+        out.print(f"  [dim]{escape(_short(output, 600))}[/dim]")
     elif kind == "review":
         if not data:
-            console.print("Revisione: [green]approvato[/green]")
+            out.print("Revisione: [green]approvato[/green]")
         else:
-            console.print(f"Revisione: [yellow]{len(data)} rilievi[/yellow]")
+            out.print(f"Revisione: [yellow]{len(data)} rilievi[/yellow]")
             for issue in data:
-                console.print(f"  - {escape(issue)}")
+                out.print(f"  - {escape(issue)}")
     elif kind == "fix_result":
         issue, status = data
         label = {
@@ -209,10 +231,10 @@ def _print_event(source: str, kind: str, data: Any) -> None:
             "open": "[yellow]ancora aperto[/yellow]",
             "reverted": "[red]correzione annullata: rompeva le verifiche[/red]",
         }[status]
-        console.print(f"Rilievo {label}: {escape(_short(issue, 160))}")
+        out.print(f"Rilievo {label}: {escape(_short(issue, 160))}")
     elif kind == "task_end" and isinstance(data, AgentResult):
         status = "[green]completato[/green]" if data.success else "[red]fallito[/red]"
-        console.print(f"{status} in {data.steps} passi: {escape(data.summary)}")
+        out.print(f"{status} in {data.steps} passi: {escape(data.summary)}")
 
 
 @app.command()
@@ -225,14 +247,45 @@ def run(
     """Svolge un task: crea gli agenti necessari, scrive il codice, lo testa e lo corregge."""
     cfg = load_config(config)
     workspace = workspace or Path("workspaces") / datetime.now().strftime("%Y%m%d-%H%M%S")
-    console.print(f"Cartella di lavoro: {workspace.resolve()}")
-    try:
-        report = run_task(task, workspace, cfg, _print_event, model)
-    except (SetupError, SandboxError, MemoryPressureError, LLMBackendError) as exc:
-        console.print(f"[red]Errore:[/red] {escape(str(exc))}")
-        raise typer.Exit(code=1) from exc
+    log = SessionLog(task, workspace.resolve())
+    out.mirror = Console(file=log.transcript, width=120, no_color=True)
+    outcome: dict = {"outcome": "error"}
+    started = time.monotonic()
 
-    console.rule("Risultato")
+    def on_event(source: str, kind: str, data: Any) -> None:
+        log.event(source, kind, data)
+        _print_event(source, kind, data)
+
+    out.print(f"Richiesta: {escape(task)}")
+    out.print(f"Cartella di lavoro: {workspace.resolve()}")
+    try:
+        try:
+            report = run_task(task, workspace, cfg, on_event, model)
+        except (SetupError, SandboxError, MemoryPressureError, LLMBackendError) as exc:
+            outcome["error"] = str(exc)
+            out.print(f"[red]Errore:[/red] {escape(str(exc))}")
+            raise typer.Exit(code=1) from exc
+        outcome = {
+            "outcome": "success" if report.result.success else "failure",
+            "kind": report.result.kind,
+            "open_issues": list(report.result.issues),
+            "restored": report.result.restored,
+            "model": report.model.name,
+            "tokens_per_second": round(report.tokens_per_second, 1),
+            "min_ram_available_mb": report.peak.min_ram_available_mb,
+        }
+        _print_summary(report, workspace)
+    finally:
+        outcome["seconds"] = round(time.monotonic() - started)
+        console.print(f"Resoconto della sessione: {log.dir}")
+        out.mirror = None
+        log.finish(outcome)
+    if not report.result.success:
+        raise typer.Exit(code=1)
+
+
+def _print_summary(report: RunReport, workspace: Path) -> None:
+    out.rule("Risultato")
     summary = Table(show_header=False)
     if not report.result.success:
         outcome = "[red]non riuscito[/red]"
@@ -249,17 +302,45 @@ def run(
     if report.peak.min_vram_free_mb is not None:
         summary.add_row("VRAM libera minima", f"{report.peak.min_vram_free_mb} MB")
     summary.add_row("Crescita dello swap", f"{report.peak.swap_growth_mb} MB")
-    console.print(summary)
+    out.print(summary)
     if report.result.restored:
-        console.print("La cartella funzionava prima di questa sessione: è stata riportata allo stato iniziale.")
+        out.print("La cartella funzionava prima di questa sessione: è stata riportata allo stato iniziale.")
     for issue in report.result.issues:
-        console.print(f"  rilievo aperto: {escape(issue)}")
+        out.print(f"  rilievo aperto: {escape(issue)}")
     answer = workspace / REPORT_NAME
     if report.result.kind == "research" and answer.is_file():
-        console.rule(REPORT_NAME)
-        console.print(Markdown(answer.read_text(encoding="utf-8")))
-    if not report.result.success:
+        out.rule(REPORT_NAME)
+        out.print(Markdown(answer.read_text(encoding="utf-8")))
+
+
+@app.command("log")
+def show_log(
+    number: int = typer.Argument(1, help="Quale sessione mostrare: 1 è l'ultima, 2 la penultima, ..."),
+    list_runs: bool = typer.Option(False, "--list", "-l", help="Elenca le ultime sessioni invece di mostrarne una."),
+) -> None:
+    """Mostra il resoconto di una sessione passata."""
+    runs = recent(limit=max(number, 15))
+    if not runs:
+        console.print("Nessuna sessione registrata.")
         raise typer.Exit(code=1)
+    if list_runs:
+        table = Table(title="Ultime sessioni")
+        for column in ("N.", "Quando", "Esito", "Durata", "Richiesta"):
+            table.add_column(column)
+        for index, folder in enumerate(runs, 1):
+            result = json.loads((folder / RESULT).read_text(encoding="utf-8"))
+            table.add_row(
+                str(index), result.get("started", ""), result.get("outcome", ""),
+                f"{result.get('seconds', '?')}s", escape(_short(result.get("task", ""), 70)),
+            )
+        console.print(table)
+        return
+    if number < 1 or number > len(runs):
+        console.print(f"Ci sono solo {len(runs)} sessioni registrate.")
+        raise typer.Exit(code=1)
+    folder = runs[number - 1]
+    console.print(escape((folder / TRANSCRIPT).read_text(encoding="utf-8")), highlight=False)
+    console.print(f"Cartella del resoconto: {folder}")
 
 
 @app.command()

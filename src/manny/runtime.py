@@ -2,24 +2,32 @@
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from manny.agents.orchestrator import Orchestrator, RunResult
-from manny.checks import check_report, check_web
+from manny.checks import check_project_pages, check_report, check_web, server_entrypoints
 from manny.config import Config
 from manny.hardware import profiler
 from manny.hardware.governor import Budget, MemoryGovernor, PeakUsage
 from manny.llm.catalog import ModelChoice, load_catalog, place, rank_choices
 from manny.llm.manager import ModelManager
 from manny.llm.ollama import OllamaClient
-from manny.sandbox.docker import DockerSandbox
+from manny.sandbox.docker import DockerSandbox, Sandbox
 from manny.services import searxng_healthy
+from manny.tools.base import truncate_middle
 from manny.tools.exec import exec_tools, run_pytest
 from manny.tools.fs import ListArgs, Workspace, fs_tools
 from manny.tools.web import web_tools
+
+
+# A server is given this long to crash; one still running after it has started properly.
+START_SECONDS = 8.0
+MAX_START_CHECKS = 2
+START_OUTPUT_CHARS = 1500
 
 
 def model_budget(governor: MemoryGovernor, client: OllamaClient) -> Budget:
@@ -34,6 +42,28 @@ def model_budget(governor: MemoryGovernor, client: OllamaClient) -> Budget:
     if vram is not None:
         vram += sum(m.vram_mb for m in loaded)
     return Budget(budget.ram_mb + sum(m.size_mb - m.vram_mb for m in loaded), vram)
+
+
+def check_python_project(sandbox: Sandbox, root: Path) -> tuple[bool, str]:
+    """The test suite, then what tests with a test client never exercise: that a server
+    really starts, and that the web pages coming with it are wired to it."""
+    passed, report = run_pytest(sandbox)
+    if not passed:
+        return False, report
+    for entry in server_entrypoints(root)[:MAX_START_CHECKS]:
+        name = entry.relative_to(root)
+        started = sandbox.exec(f"exec python {shlex.quote(str(name))}", timeout=START_SECONDS)
+        # Still running when the time is up is what a server should do.
+        if not started.timed_out and started.exit_code != 0:
+            return False, (
+                f"The tests pass, but `python {name}` crashes at startup instead of serving. "
+                f"Fix it, and keep the start-up code working under the real framework:\n"
+                + truncate_middle(started.output, START_OUTPUT_CHARS)
+            )
+    pages_ok, problems = check_project_pages(root)
+    if not pages_ok:
+        return False, f"The tests pass, but the web pages of the project have problems:\n{problems}"
+    return True, report
 
 
 class SetupError(RuntimeError):
@@ -113,7 +143,7 @@ def run_task(
 
     with DockerSandbox(ws.root, cfg.sandbox, governor.sandbox_memory_mb(cfg.sandbox.memory_mb)) as sandbox:
         tools.update({t.name: t for t in exec_tools(sandbox)})
-        verifiers = {"python": lambda: run_pytest(sandbox), "web": lambda: check_web(ws.root)}
+        verifiers = {"python": lambda: check_python_project(sandbox, ws.root), "web": lambda: check_web(ws.root)}
         if web_enabled:
             verifiers["research"] = lambda: check_report(ws.root, seen_urls)
         orchestrator = Orchestrator(

@@ -137,3 +137,24 @@ def test_reasoning_calls_get_extra_output_room():
     manager.chat(MSG)
     manager.chat(MSG, think=True)
     assert calls == [(False, 3072), (True, 3072 + 1536)]
+
+
+def test_replies_are_sized_to_the_time_left_and_none_is_asked_when_it_is_gone():
+    sizes = []
+
+    class Recording(FakeBackend):
+        def chat(self, model, messages, num_ctx, schema=None, max_tokens=None, think=None, temperature=None):
+            sizes.append(max_tokens)
+            return super().chat(model, messages, num_ctx, schema, max_tokens, think, temperature)
+
+    left = iter([600.0, 60.0, 2.0, 0.0])
+    manager = ModelManager(
+        Recording(['{"value": 1}'] * 3), make_governor(FakeMemory(ram=8000, vram=5700)),
+        [choice("m", 3000, num_ctx=16384)],
+    )
+    for _ in range(3):
+        manager.structured(MSG, Answer, remaining=lambda: next(left))
+    # 15 tokens/s assumed: plenty of time, one minute, two seconds (never below the floor).
+    assert sizes == [3072, 900, 256]
+    with pytest.raises(LLMFormatError, match="no time left"):
+        manager.structured(MSG, Answer, remaining=lambda: next(left))

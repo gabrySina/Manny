@@ -84,3 +84,69 @@ def test_placeholder_image_services_are_flagged(tmp_path):
     write(tmp_path, {"index.html": page, "css/style.css": GOOD_CSS})
     passed, report = check_web(tmp_path)
     assert not passed and "placeholder.com" in report
+
+
+from manny.checks import check_project_pages, wiring_problems
+
+# The situation from a real run: a login page that looks complete and cannot work.
+SERVER = '''from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+@app.route('/register', methods=['POST'])
+def register(): ...
+
+@app.route('/login', methods=['POST'])
+def login(): ...
+
+@app.route('/user/<int:user_id>', methods=['GET'])
+def get_user(user_id): ...
+'''
+LOGIN_PAGE = '''<!DOCTYPE html><html lang="it"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Accesso</title></head>
+<body><form onsubmit="go(event)"><input id="u"><button>Accedi</button></form>
+<script>
+async function go(e) { e.preventDefault(); await fetch('/login', { method: 'POST' }); }
+async function load() { await fetch(`/user/7`); }
+</script></body></html>'''
+
+
+def test_page_calling_a_server_that_never_serves_it_is_caught(tmp_path):
+    write(tmp_path, {"server.py": SERVER, "index.html": LOGIN_PAGE})
+    problems = wiring_problems(tmp_path)
+    assert len(problems) == 1
+    assert "relative URLs such as '/login'" in problems[0] and "Add a route for '/'" in problems[0]
+    passed, report = check_project_pages(tmp_path)
+    assert not passed and "never serves index.html" in report
+
+
+def test_page_served_by_the_server_and_calling_real_routes_passes(tmp_path):
+    served = SERVER + "\n@app.route('/')\ndef home():\n    return send_from_directory('.', 'index.html')\n"
+    write(tmp_path, {"server.py": served, "index.html": LOGIN_PAGE})
+    assert wiring_problems(tmp_path) == []
+    # A login form has little text and little CSS: that is fine for a page that comes with a program.
+    assert check_project_pages(tmp_path) == (True, "")
+
+
+def test_call_to_a_route_that_does_not_exist_is_caught(tmp_path):
+    page = LOGIN_PAGE.replace("fetch('/login'", "fetch('/api/signin'")
+    served = SERVER + "\n@app.route('/')\ndef home(): ...\n"
+    write(tmp_path, {"server.py": served, "static/app.js": "fetch('/logout')", "index.html": page.replace("<script>", '<script src="static/app.js"></script><script>')})
+    problems = wiring_problems(tmp_path)
+    assert any("calls '/api/signin', but the server defines no such route" in p for p in problems)
+    assert any("calls '/logout'" in p for p in problems) and not any("/user/7" in p for p in problems)
+
+
+def test_absolute_local_calls_need_the_page_served_or_cors(tmp_path):
+    page = LOGIN_PAGE.replace("fetch('/login'", "fetch('http://localhost:5000/login'").replace("fetch(`/user/7`)", "1")
+    write(tmp_path, {"server.py": SERVER, "index.html": page})
+    assert any("CORS" in p for p in wiring_problems(tmp_path))
+    write(tmp_path, {"server.py": SERVER + "\nfrom flask_cors import CORS\nCORS(app)\n"})
+    assert wiring_problems(tmp_path) == []
+
+
+def test_static_sites_and_form_actions(tmp_path):
+    write(tmp_path, {"index.html": GOOD_PAGE, "css/style.css": GOOD_CSS, "pane.svg": "<svg/>"})
+    assert wiring_problems(tmp_path) == []
+    form = LOGIN_PAGE.replace('<form onsubmit="go(event)">', '<form action="/subscribe" method="post">')
+    write(tmp_path / "app", {"server.py": SERVER + "\n@app.route('/')\ndef home(): ...\n", "index.html": form})
+    assert any("calls '/subscribe'" in p for p in wiring_problems(tmp_path / "app"))

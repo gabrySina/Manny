@@ -71,3 +71,13 @@ def test_timeout_kills_the_command(sandbox):
 def test_cannot_write_outside_workspace_as_root(sandbox):
     assert sandbox.exec("id -u").output == str(os.getuid())
     assert sandbox.exec("touch /etc/owned").exit_code != 0
+
+
+def test_nothing_started_by_a_command_outlives_it(sandbox):
+    # A server left in the background would keep its port for the rest of the task.
+    serve = "python -m http.server 8765 >/dev/null 2>&1 & sleep 1; echo started"
+    assert sandbox.exec(serve).output == "started"
+    assert sandbox.exec(serve).output == "started"
+    listening = sandbox.exec("python -c \"import socket; s = socket.socket(); print(s.connect_ex(('127.0.0.1', 8765)))\"")
+    assert listening.output != "0"
+    assert sandbox.exec("echo still alive").output == "still alive"

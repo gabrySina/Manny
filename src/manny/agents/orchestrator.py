@@ -86,7 +86,10 @@ KIND_NOTES = {
         "When you call finish, pytest runs on the workspace and must pass. Write plain pytest "
         "tests. Install third-party packages with install_packages and list them in requirements.txt. "
         "Test web applications in-process with the framework's test client (for Flask, "
-        "app.test_client()): never start a server or send HTTP requests to localhost."
+        "app.test_client()): never start a server or send HTTP requests to localhost. "
+        "A server is also started for real (python file.py) and must not crash at startup. "
+        "If the project has web pages they are checked too: the server must serve them "
+        "(a route for '/') and every URL a page calls must be one of the server's routes."
     ),
     "web": (
         "This is a static web page, checked automatically when you call finish: every linked "
@@ -209,6 +212,16 @@ class Orchestrator:
                 queue = ordered(plan.tasks)
         return self._finish(task, plan, board)
 
+    def _settle_kind(self, plan: Plan) -> None:
+        """Treat a "web" job as a Python project once the workspace holds Python code.
+
+        Planners file a page that belongs to a server under "web", whose check is meant
+        for sites to be read (enough text, rich styling) and runs neither the tests nor
+        the server. The Python check covers the pages of the project as well.
+        """
+        if plan.kind == "web" and any(name.endswith(".py") for name in self._list_files().splitlines()):
+            plan.kind = "python"
+
     def _out_of_time(self) -> bool:
         """Past the run's time limit: no new work starts, only the final check."""
         return self._clock() > self._deadline
@@ -222,6 +235,7 @@ class Orchestrator:
         verify: Verifier | None = None,
         deliberate: bool = False,
     ) -> bool:
+        self._settle_kind(plan)
         if verify is None and node.gated:
             verify = self._verifiers.get(plan.kind)
         agent = Agent(spec, self._llm, self._tools, self._cfg, verify, self._on_event, self._clock, deliberate)
@@ -277,6 +291,7 @@ class Orchestrator:
 
     def _fix_verifier(self, plan: Plan) -> Verifier:
         """The usual check, refused outright while the fixer has not touched any file."""
+        self._settle_kind(plan)
         check = self._verifiers.get(plan.kind)
         before = self._fingerprint() if self._fingerprint is not None else None
 
@@ -307,6 +322,7 @@ class Orchestrator:
 
     def _check(self, plan: Plan, board: Blackboard) -> tuple[bool, str]:
         """Evidence that the work is done: the automatic check for this kind, when there is one."""
+        self._settle_kind(plan)
         verify = self._verifiers.get(plan.kind)
         if verify is None:
             if not board.records:
@@ -322,7 +338,10 @@ class Orchestrator:
         return self._snapshot(max(room - REVIEW_PROMPT_CHARS, 2000))
 
     def _review(self, task: str, plan: Plan, check_output: str) -> list[str]:
-        review = review_work(self._llm, task, plan.kind, plan.criteria, self._files_for_review(), check_output)
+        review = review_work(
+            self._llm, task, plan.kind, plan.criteria, self._files_for_review(), check_output,
+            audit=self._cfg.audit_checklist,
+        )
         issues = [] if review is None else review.issues
         self._on_event("orchestrator", "review", issues)
         return issues
@@ -362,6 +381,8 @@ class Orchestrator:
             plan = None
         if plan is None:
             plan = self._fallback_plan(task)
+        # Before the tools are chosen: a Python project needs the tools to run it.
+        self._settle_kind(plan)
         for agent in plan.agents:
             wanted = [*agent.tools, *READ_TOOLS]
             if "web_search" in agent.tools:

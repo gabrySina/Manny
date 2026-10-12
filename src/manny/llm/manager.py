@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -18,6 +19,11 @@ MAX_OUTPUT_TOKENS = 3072
 TRUNCATED_ECHO_CHARS = 300
 # Extra output allowance for a call that reasons before answering.
 THINKING_TOKENS = 1536
+# A reply is never capped below this, however little time is left.
+MIN_REPLY_TOKENS = 256
+# Speed assumed until enough generation has been timed.
+DEFAULT_TOKENS_PER_SECOND = 15.0
+MIN_SPEED_SAMPLE_SECONDS = 5.0
 
 
 class ModelManager:
@@ -48,6 +54,13 @@ class ModelManager:
         self.eval_seconds = 0.0
 
     @property
+    def tokens_per_second(self) -> float:
+        """Generation speed measured so far in this session, or a cautious guess."""
+        if self.eval_seconds >= MIN_SPEED_SAMPLE_SECONDS:
+            return self.completion_tokens / self.eval_seconds
+        return DEFAULT_TOKENS_PER_SECOND
+
+    @property
     def max_output_tokens(self) -> int:
         return min(MAX_OUTPUT_TOKENS, self.current.num_ctx // 3)
 
@@ -57,15 +70,19 @@ class ModelManager:
         schema: dict | None = None,
         temperature: float | None = None,
         think: bool | None = None,
+        seconds_left: float | None = None,
     ) -> ChatResult:
         """One completion. `think` overrides the model's default reasoning mode for this
-        call; it is ignored for models that have no reasoning mode."""
+        call; it is ignored for models that have no reasoning mode. `seconds_left` caps
+        the length of the reply to what can be generated in that time."""
         self._admit()
         if think is None or self.current.think is None:
             think = self.current.think
         # Reasoning tokens count against the same limit as the reply: without extra room
         # a long file written after some thought gets cut off.
         max_tokens = self.max_output_tokens + (THINKING_TOKENS if think else 0)
+        if seconds_left is not None:
+            max_tokens = min(max_tokens, max(MIN_REPLY_TOKENS, int(seconds_left * self.tokens_per_second)))
         result = self._backend.chat(
             self.current.name, messages, self.current.num_ctx, schema, max_tokens, think, temperature,
         )
@@ -81,12 +98,21 @@ class ModelManager:
         schema: dict | None = None,
         temperature: float | None = None,
         think: bool | None = None,
+        retries: int | None = None,
+        remaining: Callable[[], float] | None = None,
     ) -> T:
-        """Completion parsed into `model`, re-asking when the output is malformed."""
+        """Completion parsed into `model`, re-asking when the output is malformed.
+
+        `remaining` gives the seconds the caller still has: every attempt is sized to fit,
+        and none is made once the time is gone.
+        """
         schema = schema or model.model_json_schema()
         messages = list(messages)
-        for _ in range(self._format_retries + 1):
-            result = self.chat(messages, schema, temperature, think)
+        for _ in range((self._format_retries if retries is None else retries) + 1):
+            seconds_left = remaining() if remaining is not None else None
+            if seconds_left is not None and seconds_left <= 0:
+                raise LLMFormatError("no time left for another reply")
+            result = self.chat(messages, schema, temperature, think, seconds_left)
             try:
                 return model.model_validate_json(result.content)
             except ValidationError as exc:

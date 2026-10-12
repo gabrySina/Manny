@@ -56,6 +56,8 @@ class AgentConfig(BaseModel):
     max_review_rounds: int = 1
     # Review findings sent to the fixer per round, one at a time, most severe first.
     max_fix_issues: int = 3
+    # Also check the checklist of the kind of work one item at a time (slower, far more reliable).
+    audit_checklist: bool = True
     # Wall-clock limits: one agent task, and the whole run before it wraps up.
     task_minutes: float = 10.0
     run_minutes: float = 30.0

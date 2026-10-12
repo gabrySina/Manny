@@ -26,6 +26,16 @@ ENVIRONMENT = {
 }
 
 
+# Kills every process in the container except its init and the idle process keeping it up.
+REAP = (
+    'for d in /proc/[0-9]*; do p=${d#/proc/}; '
+    '[ "$p" = 1 ] && continue; [ "$p" = "$$" ] && continue; '
+    'c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null); '
+    'case "$c" in "sleep infinity "*|"") continue ;; esac; '
+    'kill -9 "$p" 2>/dev/null; done; true'
+)
+
+
 class SandboxError(RuntimeError):
     """Docker itself failed (as opposed to a command failing inside the sandbox)."""
 
@@ -122,8 +132,17 @@ class DockerSandbox:
         finally:
             if network:
                 self._set_network(False)
+            self._reap()
         timed_out = done.returncode == KILLED and time.monotonic() - started >= timeout
         return ExecResult(done.returncode, (done.stdout + done.stderr).strip(), timed_out)
+
+    def _reap(self) -> None:
+        """Kill whatever the last command left running.
+
+        A server started in the background would otherwise keep its port and memory for
+        the rest of the task, and make the next start of the same program fail.
+        """
+        _docker("exec", self.name, "sh", "-c", REAP)
 
     def close(self) -> None:
         if self._started:
